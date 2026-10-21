@@ -55,6 +55,7 @@ _DEVICE_STATE_SID = "devicestate"
 _MESSAGE_BOARD_SID = "messageboard"
 _MESSAGE_BOARD_WIRE_SID = "messageBoard"
 _REMOTE_CONTROL_SID = "remotecontrol"
+_CHILD_MODE_SID = "childMode"
 
 # The real device pushes the message board with camel casing while the Profile
 # spells it lower case, so both are accepted.
@@ -323,6 +324,26 @@ async def _set_volume(device: DeviceContext, data: Mapping[str, Any]) -> None:
     await device.async_send_service(_SPEAKER_SID, {"volume": level})
 
 
+async def _set_mute(device: DeviceContext, data: Mapping[str, Any]) -> None:
+    """Mirror ``speaker.mute`` (verified: ACK errcode=0 + deviceDataChanged push)."""
+    raw = data.get("mute")
+    if isinstance(raw, str):
+        lowered = raw.strip().lower()
+        if lowered in ("true", "1", "on", "yes"):
+            muted = True
+        elif lowered in ("false", "0", "off", "no"):
+            muted = False
+        else:
+            return
+    elif isinstance(raw, bool):
+        muted = raw
+    elif isinstance(raw, (int, float)):
+        muted = bool(raw)
+    else:
+        return
+    await device.async_send_service(_SPEAKER_SID, {"mute": muted})
+
+
 async def _select_source(device: DeviceContext, data: Mapping[str, Any]) -> None:
     source = data.get("source")
     if not isinstance(source, str) or not source.strip():
@@ -330,6 +351,140 @@ async def _select_source(device: DeviceContext, data: Mapping[str, Any]) -> None
     await device.async_send_service(_INPUT_SOURCE_SID, {"name": source.strip()})
 
 
+
+
+# 画面模式的可选值取自插件反编译（hdpartner）与真机推送；
+# 写入路径见文件头注释：screen.mode {"mode": ...} 已确认可生效。
+_PICTURE_MODES: tuple[str, ...] = (
+    "STANDARD",
+    "PICTURE",
+    "VIVID",
+    "SPORTS",
+    "GAME",
+    "USER",
+    "SOFT_LIGHT",
+)
+
+
+async def _select_picture_mode(device: DeviceContext, data: Mapping[str, Any]) -> None:
+    option = data.get("option")
+    if not isinstance(option, str) or option.strip() not in _PICTURE_MODES:
+        return
+    await device.async_send_service(_SCREEN_SID, {"mode": option.strip()})
+
+
+def _child_mode_switch() -> EntitySpec:
+    """儿童模式开关（childMode.mode）。
+
+    真机验证：下发 ``{"mode": "ON"}`` 时云端返回 ``errcode=-1``（看起来是
+    "命令被拒"），但电视**随后真的回推了 mode=ON**，reported_timestamp 由
+    20261021T044645Z 更新到 20261021T074121Z —— 命令实际生效，只是返回码
+    不准（异步命令的假拒绝）。``{"mode": "OFF"}`` 同理。
+
+    因此这里按"命令实际生效"处理。副作用：HA 调用时会看到一条命令被拒的
+    报错日志，但状态最终由电视推送更新过来。
+    """
+    def state(device: DeviceContext) -> Mapping[str, Any]:
+        raw = _value(device, _CHILD_MODE_SID, "mode")
+        if isinstance(raw, str):
+            u = raw.strip().upper()
+            if u in ("ON", "LOCK_ON", "TRUE", "1"):
+                return {"is_on": True}
+            if u in ("OFF", "FALSE", "0"):
+                return {"is_on": False}
+        return {"is_on": None}
+
+    async def turn_on(device, data):
+        await device.async_send_service(_CHILD_MODE_SID, {"mode": "ON"})
+
+    async def turn_off(device, data):
+        await device.async_send_service(_CHILD_MODE_SID, {"mode": "OFF"})
+
+    return EntitySpec(
+        platform="switch",
+        key="child_mode_switch",
+        name="儿童模式",
+        state=state,
+        actions={"turn_on": turn_on, "turn_off": turn_off},
+    )
+
+
+def _picture_mode_select() -> EntitySpec:
+    """画面模式（screen.mode），真机验证可写。
+
+    验证记录（两次独立下发，云端 ``screen.mode`` 与 ``reported_timestamp``
+    都真的变了，不是乐观更新）：
+
+        PICTURE  (ts 20261021T044645Z)
+          -> 下发 {"mode": "STANDARD"}
+        STANDARD (ts 20261021T051455Z)
+          -> 下发 {"mode": "VIVID"}
+        VIVID    (ts 20261021T051755Z)
+
+    注意：状态回推有约 5-10 分钟延迟，下发后不要立刻断言失败。
+    """
+    def state(device: DeviceContext) -> Mapping[str, Any]:
+        raw = _value(device, _SCREEN_SID, "mode")
+        if isinstance(raw, str) and raw.strip() in _PICTURE_MODES:
+            return {"current_option": raw.strip()}
+        return {"current_option": None}
+    return EntitySpec(
+        platform="select",
+        key="picture_mode",
+        name="画面模式",
+        state=state,
+        metadata={"options": _PICTURE_MODES},
+        actions={"select_option": _select_picture_mode},
+    )
+
+
+# 音效模式枚举取自插件反编译（hdpartner utils/p.smali，speaker 服务处理）；
+# 括号里是该文件里与之配对的数字代码，说明这份清单是完整的。
+_SOUND_MODES: tuple[str, ...] = (
+    "AUTO",
+    "STANDARD",
+    "MUSIC",
+    "MOVIE",
+    "SPORTS",
+    "NEWS",
+    "GAME",
+    "DEVIALET",
+    "USER",
+)
+
+
+async def _select_sound_mode(device: DeviceContext, data: Mapping[str, Any]) -> None:
+    option = data.get("option")
+    if not isinstance(option, str) or option.strip() not in _SOUND_MODES:
+        return
+    await device.async_send_service(_SPEAKER_SID, {"equalizer": option.strip()})
+
+
+def _sound_mode_select() -> EntitySpec:
+    """音效模式（speaker.equalizer）。
+
+    文件头把 ``speaker.equalizer {"equalizer": ...}`` 列为已确认命令。
+    这里把它做成可选列表，替代原先只能看的 text sensor。
+
+    验证记录（云端 ``speaker.equalizer`` 与 ``reported_timestamp`` 都变了）：
+
+        AUTO  (ts 20261021T050300Z)
+          -> 下发 {"equalizer": "MUSIC"}
+        MUSIC (ts 20261021T054435Z)
+    """
+    def state(device: DeviceContext) -> Mapping[str, Any]:
+        raw = _value(device, _SPEAKER_SID, "equalizer")
+        if isinstance(raw, str) and raw.strip() in _SOUND_MODES:
+            return {"current_option": raw.strip()}
+        return {"current_option": None}
+    return EntitySpec(
+        platform="select",
+        key="sound_mode",
+        name="音效模式",
+        state=state,
+        metadata={"options": _SOUND_MODES},
+        actions={"select_option": _select_sound_mode},
+    )
 def _text_sensor(sid: str, field_name: str, name: str, key: str) -> EntitySpec:
     def state(device: DeviceContext) -> Mapping[str, Any]:
         value = _value(device, sid, field_name)
@@ -411,6 +566,32 @@ def _mute_binary_sensor() -> EntitySpec:
     )
 
 
+
+
+def _child_mode_binary_sensor() -> EntitySpec:
+    """儿童模式开关（childMode.mode）。
+
+    电视实时推送 ``childMode`` 服务，``mode`` 为 ``"ON"`` / ``"OFF"`` 字符串。
+    这里只做**只读**展示 —— 写入路径尚未在真机验证，故不暴露控制。
+    """
+    def state(device: DeviceContext) -> Mapping[str, Any]:
+        raw = _value(device, _CHILD_MODE_SID, "mode")
+        if isinstance(raw, str):
+            lowered = raw.strip().upper()
+            if lowered in ("ON", "TRUE", "1"):
+                return {"is_on": True}
+            if lowered in ("OFF", "FALSE", "0"):
+                return {"is_on": False}
+        return {"is_on": None}
+    return EntitySpec(
+        platform="binary_sensor",
+        key="child_mode",
+        name="儿童模式",
+        state=state,
+        metadata={"entity_category": "diagnostic"},
+    )
+
+
 class ProductV0A2Adapter:
     """Keep all V0A2 entity and command choices in this file."""
 
@@ -430,6 +611,7 @@ class ProductV0A2Adapter:
                 actions["turn_off"] = _turn_off
             if context.has_service(_SPEAKER_SID):
                 actions["volume"] = _set_volume
+                actions["mute"] = _set_mute
             if context.has_service(_INPUT_SOURCE_SID):
                 actions["select_source"] = _select_source
 
@@ -446,11 +628,13 @@ class ProductV0A2Adapter:
         # --- sensors --------------------------------------------------------
         if context.has_service(_SCREEN_SID):
             entities.append(_brightness_sensor())
+            entities.append(_picture_mode_select())
         if context.has_service(_SPEAKER_SID):
             entities.append(_mute_binary_sensor())
-            entities.append(
-                _text_sensor(_SPEAKER_SID, "equalizer", "音效模式", "sound_equalizer")
-            )
+            if context.has_service(_CHILD_MODE_SID):
+                entities.append(_child_mode_binary_sensor())
+                entities.append(_child_mode_switch())
+            entities.append(_sound_mode_select())
         if context.has_service(_INPUT_SOURCE_SID):
             entities.append(
                 _text_sensor(_INPUT_SOURCE_SID, "name", "输入源", "input_source")

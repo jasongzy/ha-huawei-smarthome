@@ -26,6 +26,7 @@ class HuaweiAdapterMediaPlayer(AdapterEntityMixin, MediaPlayerEntity):
             ("pause", MediaPlayerEntityFeature.PAUSE),
             ("stop", MediaPlayerEntityFeature.STOP),
             ("volume", MediaPlayerEntityFeature.VOLUME_SET),
+            ("mute", MediaPlayerEntityFeature.VOLUME_MUTE),
             ("next", MediaPlayerEntityFeature.NEXT_TRACK),
             ("previous", MediaPlayerEntityFeature.PREVIOUS_TRACK),
             ("turn_on", MediaPlayerEntityFeature.TURN_ON),
@@ -70,6 +71,7 @@ class HuaweiAdapterMediaPlayer(AdapterEntityMixin, MediaPlayerEntity):
     async def async_media_pause(self): await self._run_action("pause", {})
     async def async_media_stop(self): await self._run_action("stop", {})
     async def async_set_volume_level(self, volume: float): await self._run_action("volume", {"volume": volume})
+    async def async_mute_volume(self, mute: bool): await self._run_action("mute", {"mute": bool(mute)})
     async def async_media_next_track(self): await self._run_action("next", {})
     async def async_media_previous_track(self): await self._run_action("previous", {})
     async def async_turn_on(self): await self._run_action("turn_on", {})
